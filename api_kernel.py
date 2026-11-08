@@ -216,24 +216,19 @@ def _lb_spotify_ids(pairs: list[tuple[str, str]], batch: int = 250) -> list[list
 def find_spotify_ids(tracks: pd.DataFrame, name_col: str = "name", artist_col: str = "artist",
                      fallback: bool = True) -> pd.DataFrame:
     """Добавляет к таблице столбцы spotify_id и id_source ("listenbrainz" / "reccobeats" / None).
-    1) ListenBrainz пачкой — быстро, хорошо покрывает западную музыку;
-       из релизов трека берётся первый, у которого есть признаки в ReccoBeats;
+    1) ListenBrainz пачкой — быстро,
     2) для ненайденных (в основном русские треки) — медленный search_song_reccobeats.
     Признаки попадают в FEATURES_CACHE, повторный get_reccobeats_features по ним бесплатный."""
     keys = [(a, t) if isinstance(a, str) and isinstance(t, str) else None
             for a, t in zip(tracks[artist_col], tracks[name_col])]
     pairs = list(dict.fromkeys(k for k in keys if k))
     lb = {p: ids for p, ids in zip(pairs, _lb_spotify_ids(pairs)) if ids}
-
-    # сначала признаки только для первого релиза, остальные релизы — если у первого их нет
     get_reccobeats_features([ids[0] for ids in lb.values()])
     get_reccobeats_features([i for ids in lb.values() if not FEATURES_CACHE.get(ids[0]) for i in ids[1:]])
-
     chosen = {}
     for p, ids in lb.items():
         with_features = [i for i in ids if FEATURES_CACHE.get(i)]
         chosen[p] = ((with_features or ids)[0], "listenbrainz")
-
     missing = [p for p in pairs if p not in chosen]
     print(f"ListenBrainz нашёл {len(chosen)}/{len(pairs)}" + (f", ищу в ReccoBeats: {len(missing)}" if fallback else ""))
     cnt_reco =0
@@ -329,7 +324,7 @@ if __name__ == "__main__":
             "id": t["id"],
             "artist": t["artists"][0]["name"] if t.get("artists") else None,
             "liked": 2 if t["id"] in liked_ids else 1
-        } for t in (liked + recent)[:80]]) # чисто для теста УДАЛИ [:10] 
+        } for t in (liked + recent)[:100]]) # [:100] нужно чтобы не закончилась квота спотика на запросы 
         tracks = tracks.drop_duplicates(subset="id", keep="first")
         lfm_rec = pd.DataFrame()
         rec = pd.DataFrame()
@@ -338,7 +333,7 @@ if __name__ == "__main__":
             df = get_similar_lastfm(_norm(i.name), _norm(i.artist), limit=10)
             if df.empty: 
                 print(f"No recommendations found for {i.name} by {i.artist} lastfm")
-                df = get_simmilar_yandex(_norm(i.name), _norm(i.artist), limit=10) 
+                df = get_simmilar_yandex(i.name, i.artist, limit=10)
             df = find_spotify_ids(df, name_col="name", artist_col="artist")
             df = df.dropna(subset=["spotify_id"])
             print(f"df: {df}")
@@ -385,9 +380,25 @@ if __name__ == "__main__":
         print(df)
         f = open("soso3.txt", "w", encoding="utf-8")
         for i in df.itertuples():
-            time.sleep(5)
+            time.sleep(1)
             name, artist = get_spotify_song_from_id(i.id)
-            f.write(f"{name} | {artist}\n")
+            f.write(f"{name} | {artist} | {i.id}\n")
         f.close()
-    else: 
+        sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == "playlist":
+        print(make_auth_url('12345'))
+        import uvicorn
+        import threading
+        import time
+        def run_server():
+            uvicorn.run(app, host="127.0.0.1", port=8888)
+        server_thread = threading.Thread(target=run_server, daemon=True)
+        server_thread.start()
+        time.sleep(15) 
+        ids = pd.read_csv("model_recomendations.csv").loc[lambda x : x["predicted_liked"] == 1, "id"].drop_duplicates().to_list()
+        create_spotify_playlist("Model recommendations", ids, ID2TOKEN['12345']['access_token'])
+        
+    else:
+        from model import get_simmilar_yandex
+        print(get_simmilar_yandex("супермаркет", "madk1d")) 
         sys.exit(0)

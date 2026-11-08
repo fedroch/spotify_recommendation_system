@@ -1,4 +1,7 @@
 import os
+import re
+import unicodedata
+from urllib.parse import quote
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 import pandas as pd
@@ -15,6 +18,7 @@ import joblib
 
 load_dotenv()
 LASTFM_KEY = os.environ["api_key_lastfm"]
+YANDEX_TOKEN = os.environ["yandex_music_token"]
 
 def get_similar_recobeats(song_ids: list, size: int = 10, **features) -> pd.DataFrame:
     tracks_total = pd.DataFrame()
@@ -47,90 +51,132 @@ def get_similar_lastfm(song_name: str, artist_name: str, limit: int = 15) -> pd.
                          for t in items])
 
 
-def get_simmilar_yandex(song_name: str, artist_name: str, limit: int = 15) -> pd.DataFrame:
-    """Ищет трек и получает похожие через неофициальный API Яндекс Музыки.
+def _yandex_name_key(value: str) -> str:
+    """Сопоставляет регистр, пунктуацию, пробелы и простую транслитерацию."""
+    transliteration = str.maketrans(dict(zip(
+        "абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+        ["a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "y", "k",
+         "l", "m", "n", "o", "p", "r", "s", "t", "u", "f", "kh", "ts",
+         "ch", "sh", "shch", "", "y", "", "e", "yu", "ya"],
+    )))
+    value = unicodedata.normalize("NFKC", value).casefold().translate(transliteration)
+    return "".join(char for char in value if char.isalnum())
 
-    Работает без токена, если сервер разрешает анонимный доступ. Возвращает
-    столбцы get_similar_lastfm: name, artist, match, playcount, в том числе
-    для пустого результата. match = 1 / позиция в итоговом списке (не оценка Яндекса
-    и не Last.fm match); playcount = 0 означает, что статистика неизвестна.
-    При ошибке API выводит причину и возвращает пустую таблицу.
-    """
-    columns = ["name", "artist", "match", "playcount"]
-    empty = pd.DataFrame(columns=columns)
-    if limit <= 0 or not all(isinstance(s, str) and s.strip()
-                             for s in (song_name, artist_name)):
-        return empty
 
-    def fetch(path: str, **params) -> dict:
-        response = requests.get(
-            "https://api.music.yandex.net" + path, params=params, timeout=20
-        )
-        response.raise_for_status()
-        data = response.json()
-        if not isinstance(data, dict):
-            raise ValueError("API вернул неожиданный формат JSON")
-        if data.get("error"):
-            raise ValueError(f"ошибка API: {data['error']}")
-        result = data.get("result")
-        if not isinstance(result, dict):
-            raise ValueError("в ответе API нет объекта result")
-        return result
+def _yandex_without_feature(value: str) -> str:
+    return re.sub(r"\s*[\(\[]?\s*\b(?:feat\.?|ft\.?|featuring)\s+.*$",
+                  "", value, flags=re.IGNORECASE).strip()
 
-    def artist_names(track: dict) -> list[str]:
-        artists = track.get("artists") or []
-        if not isinstance(artists, list):
-            return []
-        return [a["name"] for a in artists
-                if isinstance(a, dict) and isinstance(a.get("name"), str) and a["name"].strip()]
 
-    try:
-        result = fetch("/search", text=f"{artist_name} {song_name}",
-                       type="track", page=0, nocorrect="true")
-        search = result.get("tracks") or {}
-        if not isinstance(search, dict):
-            raise ValueError("API вернул неожиданный формат результатов поиска")
-        search_tracks = search.get("results") or []
-        if not isinstance(search_tracks, list):
-            raise ValueError("API вернул результаты поиска вместо списка")
-        title_key, artist_key = _norm(song_name), _norm(artist_name)
-        target = next((track for track in search_tracks
-                       if isinstance(track, dict) and track.get("id") is not None
-                       and isinstance(track.get("title"), str)
-                       and _norm(track["title"]) == title_key
-                       and artist_key in map(_norm, artist_names(track))), None)
-        if target is None:
-            print(f"Яндекс Музыка: трек не найден: {artist_name} — {song_name}")
-            return empty
+def _yandex_request(method: str, path: str, token: str | None = YANDEX_TOKEN, **kwargs) -> dict:
+    request = requests.get if method == "GET" else requests.post
+    headers = {"Authorization": f"OAuth {token}"} if token else {}
+    response = request("https://api.music.yandex.net" + path,
+                       headers=headers, timeout=20, **kwargs)
+    response.raise_for_status()
+    data = response.json()
+    if data.get("error"):
+        raise ValueError(str(data["error"]))
+    return data["result"]
 
-        result = fetch(f"/tracks/{target['id']}/similar")
-        similar = result.get("similarTracks") or []
-        if not isinstance(similar, list):
-            raise ValueError("API вернул похожие треки вместо списка")
-        rows, seen = [], set()
-        for track in similar:
-            if not isinstance(track, dict):
-                continue
-            name, artists = track.get("title"), artist_names(track)
-            if not isinstance(name, str) or not name.strip() or not artists:
-                continue
-            if (str(track.get("id")) == str(target["id"])
-                    or (_norm(name) == title_key and artist_key in map(_norm, artists))):
-                continue
-            version = track.get("version")
-            if isinstance(version, str) and version.strip():
-                name = f"{name} - {version}"
-            key = (name.casefold(), artists[0].casefold())
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append({"name": name, "artist": artists[0],
-                         "match": 1.0 / (len(rows) + 1), "playcount": 0})
-            if len(rows) >= limit:
+
+def find_yandex_track_id(song_name: str, artist_name: str, *,
+                         token: str | None = YANDEX_TOKEN, max_pages: int = 3) -> str | None:
+    """Ищет ID по названию и артисту; нормализация, запасные запросы и пагинация."""
+    title = _yandex_without_feature(song_name)
+    exact = _yandex_name_key(title)
+    base = _yandex_name_key(_norm(title))
+    artist = _yandex_name_key(artist_name)
+    queries = dict.fromkeys([f"{artist_name} {song_name}", f"{artist_name} {_norm(title)}", song_name])
+    fallback = None
+    for query in queries:
+        for page in range(max_pages):
+            result = _yandex_request("GET", "/search", token, params={
+                "text": query, "type": "track", "page": page, "nocorrect": "false",
+            })
+            search = result.get("tracks") or {}
+            tracks = search.get("results") or []
+            for track in tracks:
+                if not track.get("id") or not track.get("title"):
+                    continue
+                artists = [_yandex_name_key(a["name"]) for a in (track.get("artists") or [])]
+                if artist not in artists:
+                    continue
+                name = _yandex_without_feature(track["title"])
+                full_name = f"{name} {track.get('version') or ''}"
+                if _yandex_name_key(full_name) == exact:
+                    return str(track["id"])
+                if _yandex_name_key(_norm(full_name)) == base:
+                    fallback = fallback or str(track["id"])
+            per_page, total = search.get("perPage") or len(tracks), search.get("total")
+            if not tracks or (total is not None and (page + 1) * per_page >= total):
                 break
-        return pd.DataFrame(rows, columns=columns)
-    except (requests.RequestException, ValueError) as error:
-        print(f"Яндекс Музыка: {type(error).__name__}: {error}")
+    return fallback
+
+
+def get_yandex_radio(track_id: str, limit: int = 15, *, token: str | None = YANDEX_TOKEN,
+                     max_batches: int = 5) -> pd.DataFrame:
+    """Получает радио по ID. match = 1 / позиция; playcount = 0 — нет статистики."""
+    columns = ["name", "artist", "match", "playcount"]
+    if limit <= 0 or max_batches <= 0:
+        return pd.DataFrame(columns=columns)
+    queue, songs = [str(track_id)], {}
+    seen = set(queue)
+    result = _yandex_request("POST", "/rotor/session/new", token, json={
+        "seeds": [f"track:{track_id}"], "queue": queue.copy(),
+        "includeTracksInResponse": True, "incognito": True,
+    })
+    session_id = quote(result["radioSessionId"], safe="")
+    for batch in range(max_batches):
+        if result.get("unknownSession"):
+            raise ValueError("Радиосессия Яндекса не найдена")
+        count_before = len(seen)
+        for item in result.get("sequence") or []:
+            track = item.get("track")
+            if item.get("type", "track") != "track" or not track or not track.get("id"):
+                continue
+            identifier = str(track["id"])
+            if identifier in seen:
+                continue
+            seen.add(identifier)
+            queue.append(identifier)
+            if not track.get("title") or not track.get("artists"):
+                continue
+            name = track["title"]
+            if track.get("version"):
+                name += f" - {track['version']}"
+            artist = track["artists"][0]["name"]
+            songs.setdefault((_yandex_name_key(name), _yandex_name_key(artist)), (name, artist))
+            if len(songs) >= limit:
+                break
+        if len(songs) >= limit or result.get("terminated") or (batch > 0 and len(seen) == count_before):
+            break
+        if batch + 1 < max_batches:
+            result = _yandex_request("POST", f"/rotor/session/{session_id}/tracks", token,
+                                    json={"queue": queue.copy()})
+    frame = pd.DataFrame(songs.values(), columns=["name", "artist"]).reset_index(drop=True)
+    frame["match"] = 1.0 / np.arange(1, len(frame) + 1)
+    frame["playcount"] = 0
+    return frame[columns]
+
+
+def get_simmilar_yandex(song_name: str, artist_name: str, limit: int = 15, *, max_pages: int = 3, token: str | None = YANDEX_TOKEN, max_batches: int = 5) -> pd.DataFrame:
+    empty = pd.DataFrame(columns=["name", "artist", "match", "playcount"])
+    if not song_name or not artist_name or limit <= 0:
+        return empty
+    try:
+        track_id = find_yandex_track_id(song_name, artist_name, token=token, max_pages=max_pages)
+        if track_id is None:
+            print(f"Яндекс Музыка: не удалось сопоставить {artist_name} — {song_name}")
+            return empty
+        frame = get_yandex_radio(track_id, limit, token=token, max_batches=max_batches)
+        if frame.empty:
+            print(f"Яндекс Музыка: радио по треку {track_id} не вернуло кандидатов")
+        return frame
+    except (requests.RequestException, ValueError, KeyError) as error:
+        response = getattr(error, "response", None)
+        message = f"HTTP {response.status_code}: {response.text[:500]}" if response is not None else str(error)
+        print("Яндекс Музыка:", message.replace(token, "[REDACTED]") if token else message)
         return empty
 
 
@@ -138,7 +184,6 @@ AUDIO_FEATURES = ["acousticness", "danceability", "energy", "instrumentalness",
                   "liveness", "loudness", "mode", "speechiness", "tempo", "valence"]
 
 def track_key(df: pd.DataFrame, name_col: str, artist_col: str) -> pd.Series:
-    # "название | артист" без регистра и feat./remaster — разные релизы одного трека совпадут
     return df[name_col].map(_norm) + " | " + df[artist_col].map(_norm)
 
 def count_artist_songs_match(liked: pd.DataFrame, recomendations: pd.DataFrame) -> pd.DataFrame:
@@ -176,11 +221,12 @@ if __name__ == "__main__":
         for i in similar_extraction.itertuples():
             cnt+=1
             print(f"lastfm similar search: {cnt}")
-            _rec = get_similar_lastfm(i.name, i.artist, limit=100)
+            _rec = get_similar_lastfm(i.name, i.artist_name, limit=20)
             if _rec.empty:
                 print(f"lastfm similar search: {cnt} - empty")
-                _rec = get_simmilar_yandex(i.name, i.artist, limit=100)
-            df = pd.concat([df, _rec])
+            _rec_y = get_simmilar_yandex(i.name, i.artist_name, limit=20)
+            _rec_full = pd.concat([_rec, _rec_y])
+            df = pd.concat([df, _rec_full])
 
         df = df.groupby(["name", "artist"], as_index=False).agg(
             match=("match", "max"), match_mean=("match", "mean"),
@@ -189,16 +235,16 @@ if __name__ == "__main__":
         df = find_spotify_ids(df, name_col="name", artist_col="artist")
         print('done')
         df = df.dropna(subset=["spotify_id"])
-        df = df[~track_key(df, "name", "artist").isin(track_key(similar_extraction, "name", "artist"))]
+        df = df[~track_key(df, "name", "artist").isin(track_key(similar_extraction, "name", "artist_name"))]
         df.to_csv("soso.csv", index=False)
         print(df)
 
         df_emb = count_artist_songs_match(liked=similar_extraction, recomendations=df)
-        df_emb["liked"] = track_key(df, "name", "artist").isin(track_key(check, "name", "artist"))
+        df_emb["liked"] = track_key(df, "name", "artist").isin(track_key(check, "name", "artist_name"))
         df_emb = df_emb.dropna()
         df_emb.to_csv("data/recomendation_embeddings.csv", index=False)
     if len(sys.argv)>1 and sys.argv[1] == "learn":
-        model = make_pipeline(StandardScaler(), LogisticRegression(class_weight='balanced'))
+        model = make_pipeline(StandardScaler(), LogisticRegression(class_weight='balanced', solver = "newton-cholesky"))
         df = pd.read_csv("data/recomendation_embeddings.csv")
         X = df.drop(columns=["id", "liked"])
         Y = df["liked"]
