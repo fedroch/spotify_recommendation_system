@@ -265,7 +265,7 @@ def create_spotify_playlist(name: str, track_ids: list[str], access_token: str) 
     for start in range(0, len(uris), 100):
         r = requests.post(f"https://api.spotify.com/v1/playlists/{playlist['id']}/items",headers=headers,json={"uris": uris[start:start + 100]},timeout=20,)
         r.raise_for_status()
-    return playlist["external_urls"]["spotify"]
+    return playlist["external_urls"]["spotify"], playlist['id']
 
 
 import sys
@@ -395,8 +395,8 @@ if __name__ == "__main__":
         server_thread = threading.Thread(target=run_server, daemon=True)
         server_thread.start()
         time.sleep(15) 
-        ids = pd.read_csv("model_recomendations.csv").loc[lambda x : x["predicted_liked"] == 1, "id"].drop_duplicates().to_list()
-        create_spotify_playlist("Model recommendations", ids, ID2TOKEN['12345']['access_token'])
+        ids = pd.read_csv("model_recomendations.csv").loc[lambda x : x["predicted_liked"] == 1, "id"].drop_duplicates().sample(frac=1).to_list()
+        url, playlist_id = create_spotify_playlist("Model recommendations", ids, ID2TOKEN['12345']['access_token'])
         
     else:
         from model import get_simmilar_yandex
