@@ -397,7 +397,17 @@ if __name__ == "__main__":
         time.sleep(15) 
         ids = pd.read_csv("model_recomendations.csv").loc[lambda x : x["predicted_liked"] == 1, "id"].drop_duplicates().sample(frac=1).to_list()
         url, playlist_id = create_spotify_playlist("Model recommendations", ids, ID2TOKEN['12345']['access_token'])
-        
+        with open("logo.jpg", "rb") as f:
+            image = base64.b64encode(f.read()).decode("ascii")
+            response = requests.put(
+                f"https://api.spotify.com/v1/playlists/{playlist_id}/images",
+                headers={
+                    "Authorization": f"Bearer {ID2TOKEN['12345']}",
+                    "Content-Type": "image/jpeg",
+                },
+                data=image,
+                timeout=30,
+            )
     else:
         from model import get_simmilar_yandex
         print(get_simmilar_yandex("супермаркет", "madk1d")) 
